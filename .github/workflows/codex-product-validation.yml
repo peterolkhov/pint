@@ -1,0 +1,129 @@
+name: Codex product-units native validation
+on:
+  push:
+    branches: [codex/validate-product-units]
+permissions:
+  contents: read
+jobs:
+  red-green-and-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: "3.12"
+            numpy: "2.0.2"
+          - python: "3.13"
+            numpy: "2.4.6"
+    env:
+      PIP_NO_CACHE_DIR: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: peterolkhov/pint
+          ref: b301709f1953ffb80fcf66d9e50189b5e4103bab
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install current source and required test dependencies
+        run: |
+          python -m pip install --report /tmp/pint-install-report.json -e '.[test,numpy]' packaging 'numpy==${{ matrix.numpy }}'
+          python -m pip freeze
+      - name: Prove new native regressions fail on original owner
+        run: |
+          cp pint/facets/numpy/numpy_func.py /tmp/pint-reviewed-fixed-source.py
+          git show 12b327b1f55fbef9d4aceab76edd463edfcdc0d6:pint/facets/numpy/numpy_func.py > pint/facets/numpy/numpy_func.py
+          set +e
+          python -m pytest -q pint/testsuite/test_numpy.py -k 'test_prod_reduction_factor_count or test_prod_reduction_empty or test_prod_reduction_heterogeneous_units or test_prod_reduction_duplicate_axes' --tb=short --junitxml=/tmp/pint-red.xml
+          red_status=$?
+          set -e
+          cp /tmp/pint-reviewed-fixed-source.py pint/facets/numpy/numpy_func.py
+          test "$red_status" -eq 1
+          python - <<'PY'
+          import json,xml.etree.ElementTree as ET
+          root=ET.parse("/tmp/pint-red.xml").getroot()
+          suites=list(root.iter("testsuite"))
+          summary={k:sum(int(s.get(k,0)) for s in suites) for k in ["tests","failures","errors","skipped"]}
+          examples=[dict(name=c.get("name"),message=(c.find("failure").text or "")[:1600]) for c in root.iter("testcase") if c.find("failure") is not None]
+          print("RED_RESULT_JSON="+json.dumps(dict(summary=summary,examples=examples[:4])),flush=True)
+          assert summary["tests"]==123 and summary["errors"]==0 and summary["failures"]>0
+          PY
+
+      - name: Full native core and NumPy suite on repaired source
+        run: python -m pytest -q --tb=short --junitxml=/tmp/pint-green.xml
+      - name: Independent public API after replay
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md
+          import json, subprocess, sys
+          from pathlib import Path
+          import numpy as np
+          import pint
+          
+          PIN="b301709f1953ffb80fcf66d9e50189b5e4103bab"
+          assert subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip()==PIN
+          assert subprocess.check_output(["git","diff","--name-only"],text=True).strip()==""
+          assert Path(pint.__file__).resolve().is_relative_to(Path.cwd().resolve()/"pint")
+          r=pint.UnitRegistry()
+          rows=[]
+          cases=[
+           ("all",{},24,4,"control"),
+           ("where-true",{"where":True},24,4,"control"),
+           ("where-broadcast",{"where":[True,False]},3,2,"control"),
+           ("where-full",{"where":[[True,False],[True,True]]},12,3,"control"),
+           ("where-full-true",{"where":[[True,True],[True,True]]},24,4,"control"),
+           ("where-false",{"where":False},1,0,"control"),
+           ("axis0",{"axis":0},[3,8],2,"control"),
+           ("axis1",{"axis":1},[2,12],2,"control"),
+           ("negative-axis",{"axis":-1},[2,12],2,"control"),
+           ("tuple01",{"axis":(0,1)},24,4,"control"),
+           ("tuple10",{"axis":(1,0)},24,4,"control"),
+           ("negative-tuple",{"axis":(-2,-1)},24,4,"control"),
+           ("single-tuple",{"axis":(0,)},[3,8],2,"control"),
+           ("empty-tuple",{"axis":()},[[1,2],[3,4]],1,"control"),
+           ("tuple-mask-control",{"axis":(0,1),"where":True},24,4,"control"),
+           ("empty-tuple-mask-control",{"axis":(),"where":True},[[1,2],[3,4]],1,"control"),
+          ]
+          def match(a,b):
+           a,b=np.asarray(a),np.asarray(b)
+           return a.shape==b.shape and bool(np.allclose(a,b,rtol=1e-12,atol=0,equal_nan=True))
+          def check(entry,case,nans=False):
+           name,kwargs,expected,power,baseline=case
+           array=np.array([[1.,2.],[3.,float("nan") if nans else 4.]])
+           func=np.nanprod if entry=="np.nanprod" else np.prod
+           plain=func(array,**kwargs)
+           assert match(plain,expected),(entry,name,"bad fixture",plain,expected)
+           q=r.Quantity(array.copy(),"meter")
+           row=dict(entrypoint=entry,case=name,kwargs=kwargs,expected_magnitude=expected,expected_units=str(r.meter**power),baseline=baseline)
+           try:
+            actual=q.prod(**kwargs) if entry=="Quantity.prod" else func(q,**kwargs)
+            arr=np.asarray(actual.magnitude)
+            row.update(actual_magnitude=arr.item() if arr.ndim==0 else arr.tolist(),actual_units=str(actual.units),product_contract_met=match(actual.magnitude,plain) and actual.units==r.meter**power)
+            row["baseline_expectation_met"]=match(actual.magnitude,plain) and ((baseline=="control" and actual.units==r.meter**power) or (baseline=="wrong-unit" and actual.units==r.meter and actual.units!=r.meter**power))
+           except Exception as e:
+            row.update(exception_type=type(e).__name__,exception_message=str(e),product_contract_met=False,baseline_expectation_met=(baseline=="tuple-error" and type(e) is TypeError and str(e)=="tuple indices must be integers or slices, not tuple"))
+           rows.append(row)
+          for entry in ("np.prod","Quantity.prod","np.nanprod"):
+           for case in cases:
+            check(entry,case)
+          for case in [("documented-nan-all",{},6,3,"control"),("documented-nan-axis0",{"axis":0},[3,2],2,"control"),("documented-nan-axis1",{"axis":1},[2,3],2,"control")]:
+           check("np.nanprod",case,True)
+          report=dict(purpose="AFTER actual public API verification",source_head=PIN,source_tree=subprocess.check_output(["git","rev-parse","HEAD^{tree}"],text=True).strip(),pint_import=str(Path(pint.__file__).resolve()),numpy_version=np.__version__,python=sys.version,distributions=sorted(f"{d.metadata['Name']}=={d.version}" for d in md.distributions()),cases=len(rows),known_bug_cases=sum(x["baseline"]!="control" for x in rows),unexpected=sum(not x["baseline_expectation_met"] for x in rows),observations=rows)
+          print("DIAGNOSTIC_JSON="+json.dumps(report,sort_keys=True),flush=True)
+          assert report["cases"]==51 and report["known_bug_cases"]==0 and report["unexpected"]==0 and all(x["product_contract_met"] for x in rows)
+          PY
+
+      - name: Exact source integrity
+        run: |
+          git diff --exit-code
+          git diff --check
+          python - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          for p in ["pint/facets/numpy/numpy_func.py","pint/testsuite/test_numpy.py","CHANGES"]:
+              print("VALIDATED_FILE_JSON="+json.dumps(dict(path=p,sha256=hashlib.sha256(Path(p).read_bytes()).hexdigest())),flush=True)
+          PY
